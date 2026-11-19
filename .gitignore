@@ -35,4 +35,21 @@
 Builds/
 .vs/
 *.pdb
-/ProofOfConcept
+
+# CMake, vcpkg, F4SE i zewnetrzne biblioteki
+build/
+out/
+cmake-build-*/
+vcpkg_installed/
+extern/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.ipch
+*.suo
+*.user
+*.zip
+
+# JUCE (generowane automatycznie przez Projucer)
+JuceLibraryCode/
