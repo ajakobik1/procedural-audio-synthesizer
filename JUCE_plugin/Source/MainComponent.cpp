@@ -7,6 +7,11 @@ static float g_monsterScale = 1.0f;
 static float g_monsterSpeed = 0.0f;
 static float g_monsterCombat = 0.0f;
 static float g_monsterAttack = 0.0f;
+static float g_lastValidHP = -100.0f;
+static std::atomic<bool> g_damageTriggered{ false };
+static float g_damageVisualEnv = 0.0f;
+static std::atomic<bool> g_deathTriggered{ false };
+static double g_lastDamageTimeMs = -10000.0;
 
 //==============================================================================
 MainComponent::MainComponent()
@@ -83,12 +88,17 @@ void MainComponent::paint(juce::Graphics& g)
         g.setFont(juce::Font(24.0f, juce::Font::bold));
         g.drawText("Status: namierzono potwora, odbieranie danych...", 20, 130, 760, 40, juce::Justification::centredLeft);
 
-        // Wyswietlanie HP potwora
+        // Wyswietlanie HP potwora + sygnalizacja otrzymania obrazen
         float hpPercent = g_monsterHP * 100.0f;
-        g.setColour(juce::Colours::white);
-        g.setFont(juce::Font(36.0f, juce::Font::bold));
-        g.drawText("HP potwora: " + juce::String(hpPercent, 1) + " %", 20, 200, 760, 50, juce::Justification::centredLeft);
+        juce::String hpText = "HP potwora: " + juce::String(hpPercent, 1) + " %";
+        if (g_damageVisualEnv > 0.15f)
+            hpText += "  [OBRAZENIA!]";
 
+        g.setColour(g_damageVisualEnv > 0.15f ? juce::Colours::crimson : juce::Colours::white);
+        g.setFont(juce::Font(36.0f, juce::Font::bold));
+        g.drawText(hpText, 20, 200, 760, 50, juce::Justification::centredLeft);
+
+        g.setColour(juce::Colours::white);
         g.setFont(juce::Font(20.0f));
         g.drawText("Wartosc znormalizowana: " + juce::String(g_monsterHP, 4), 20, 250, 760, 30, juce::Justification::centredLeft);
 
@@ -193,9 +203,28 @@ void MainComponent::oscMessageReceived(const juce::OSCMessage& message)
             g_monsterHP = value;
 
             if (value >= 0.0f) {
+                float clampedNewHP = juce::jlimit(0.0f, 1.0f, value);
+
+                // Wykrywanie naglych obrazen (spadek HP o min. 0.5%)
+                if (g_lastValidHP >= 0.0f && (g_lastValidHP - clampedNewHP) > 0.005f)
+                {
+                    g_damageTriggered.store(true);
+                    g_lastDamageTimeMs = juce::Time::getMillisecondCounterHiRes();
+                }
+
+                g_lastValidHP = clampedNewHP;
                 g_packetCount++;
-                healthPercentage = juce::jlimit(0.0f, 1.0f, value);
+                healthPercentage = clampedNewHP;
                 samplesWithoutMessage = 0;
+            }
+            else {
+                // Wykrywanie smierci potwora (utrata celu po obrazeniach lub przy niskim HP)
+                double timeSinceDamage = juce::Time::getMillisecondCounterHiRes() - g_lastDamageTimeMs;
+                if (g_lastValidHP >= 0.0f && (g_lastValidHP <= 0.35f || timeSinceDamage < 2500.0))
+                {
+                    g_deathTriggered.store(true);
+                }
+                g_lastValidHP = -100.0f;
             }
             repaint();
         }
@@ -233,7 +262,6 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
 
     samplesWithoutMessage += bufferToFill.numSamples;
     bool isGameConnected = (samplesWithoutMessage < currentSampleRate * 0.5f) && (g_monsterHP >= 0.0f);
-    float targetVolume = isGameConnected ? 0.55f : 0.0f;
 
     // Zmienne stanu traktu glosowego wg modelu Wilkinsona i Reissa (2016)
     static float smoothedSpeed = 0.0f;
@@ -246,6 +274,46 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
     static float bp3Low = 0.0f, bp3Band = 0.0f;
     static float wheezeLow = 0.0f, wheezeBand = 0.0f;
     static float lipReflectState = 0.0f;
+
+    // Zmienne zdarzeniowe: atak, obrazenia oraz przedluzony ryk smierci
+    static bool wasAttacking = false;
+    static bool attackActive = false;
+    static float attackPhase = 0.0f;
+    static float attackPitchVar = 1.0f;
+    static float attackDurSec = 0.75f;
+
+    static bool painActive = false;
+    static float painPhase = 0.0f;
+    static float painPitchVar = 1.0f;
+    static float painDurSec = 0.38f;
+    static int painCooldownSamples = 0;
+
+    static bool deathActive = false;
+    static float deathPhase = 0.0f;
+
+    if (g_deathTriggered.exchange(false))
+    {
+        deathActive = true;
+        deathPhase = 0.0f;
+        attackActive = false;
+        painActive = false;
+    }
+
+    if (g_damageTriggered.exchange(false))
+    {
+        // Cooldown 0.45 s zapobiega "brzeczeniu" przy serii z miniguna + drobna losowosc brzmienia
+        if (!deathActive && painCooldownSamples <= 0)
+        {
+            painActive = true;
+            painPhase = 0.0f;
+            painPitchVar = 0.88f + randomGenerator.nextFloat() * 0.24f;
+            painDurSec = 0.32f + randomGenerator.nextFloat() * 0.14f;
+            painCooldownSamples = static_cast<int>(currentSampleRate * 0.45f);
+        }
+    }
+
+    // Podczas ryku smierci utrzymujemy audio aktywne do zakonczenia agonii
+    float targetVolume = (isGameConnected || deathActive) ? 0.55f : 0.0f;
 
     float safeScale = juce::jlimit(0.25f, 4.0f, actorScale);
     float hpClamped = juce::jlimit(0.0f, 1.0f, healthPercentage);
@@ -268,6 +336,11 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
     float fmFreq2 = 41.0f * rattleScale;
     float fmFreq3 = 19.0f * rattleScale;
 
+    float attackPhaseInc = 1.0f / (currentSampleRate * attackDurSec);
+    float painPhaseInc = 1.0f / (currentSampleRate * painDurSec);
+    float deathPhaseInc = 1.0f / (currentSampleRate * 1.80f); // 1.8 s przedluzonego ryku smierci
+    float lastPainEnv = 0.0f;
+
     for (auto sample = 0; sample < bufferToFill.numSamples; ++sample)
     {
         if (currentVolume < targetVolume) currentVolume += 0.0005f;
@@ -281,6 +354,81 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
 
         float combatTarget = isInCombat ? 1.0f : 0.0f;
         smoothedCombat += 0.0004f * (combatTarget - smoothedCombat);
+
+        // 5. Akcja ataku -> Wyzwolenie ryku z delikatna wariacja wysokosci i czasu trwania
+        if (isAttacking && !wasAttacking && !deathActive)
+        {
+            if (!attackActive || attackPhase > 0.65f)
+            {
+                attackActive = true;
+                attackPhase = 0.0f;
+                attackPitchVar = 0.90f + randomGenerator.nextFloat() * 0.20f;
+                attackDurSec = 0.68f + randomGenerator.nextFloat() * 0.20f;
+                attackPhaseInc = 1.0f / (currentSampleRate * attackDurSec);
+            }
+        }
+        wasAttacking = isAttacking;
+
+        float attackEnv = 0.0f;
+        if (attackActive)
+        {
+            attackPhase += attackPhaseInc;
+            if (attackPhase >= 1.0f)
+            {
+                attackActive = false;
+                attackPhase = 0.0f;
+            }
+            else
+            {
+                float aRise = juce::jmin(1.0f, attackPhase / 0.12f);
+                float aTail = std::sin(juce::jlimit(0.0f, 1.0f, (1.0f - attackPhase) / 0.88f) * juce::MathConstants<float>::halfPi);
+                attackEnv = aRise * aTail;
+            }
+        }
+
+        // 6. Damage Feedback -> Krotki, ostry wzdryg bolu bez wibrato (z cooldownem 0.45 s)
+        if (painCooldownSamples > 0)
+            --painCooldownSamples;
+
+        float painEnv = 0.0f;
+        if (painActive)
+        {
+            painPhase += painPhaseInc;
+            if (painPhase >= 1.0f)
+            {
+                painActive = false;
+                painPhase = 0.0f;
+            }
+            else
+            {
+                float pRise = juce::jmin(1.0f, painPhase / 0.08f);
+                float pTail = std::pow(1.0f - painPhase, 1.8f);
+                painEnv = juce::jmin(1.0f, pRise * pTail * 1.15f);
+            }
+        }
+        lastPainEnv = painEnv;
+
+        // 7. Smierc potwora -> Przedluzony, opadajacy ryk agonii (1.8 s)
+        float deathEnv = 0.0f;
+        if (deathActive)
+        {
+            deathPhase += deathPhaseInc;
+            if (deathPhase >= 1.0f)
+            {
+                deathActive = false;
+                deathPhase = 0.0f;
+            }
+            else
+            {
+                float dRise = juce::jmin(1.0f, deathPhase / 0.05f);
+                float dTail = std::pow(1.0f - deathPhase, 1.35f);
+                deathEnv = dRise * dTail;
+            }
+        }
+
+        // Jesli potwor obrywa w trakcie zamachu, bol na chwile przebija sie nad rykiem ataku
+        float effAttack = attackEnv * (1.0f - 0.5f * painEnv);
+        float eventBlend = juce::jlimit(0.0f, 1.0f, juce::jmax(effAttack, painEnv));
 
         // 1. Predkosc ruchu -> LFO oddechu (0.28 Hz spoczynek -> 0.85 Hz sprint)
         float scaleCompensatedSpeed = smoothedSpeed / juce::jmax(1.0f, safeScale * 0.85f);
@@ -309,6 +457,11 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
             exhaleEnv = attack * decay * 1.35f;
         }
 
+        // Podczas smierci calkowicie wyciszamy normalny cykl oddechu (zeby martwy potwor nie oddychal)
+        float normalBreathMask = deathActive ? 0.0f : (1.0f - eventBlend);
+        inhaleEnv *= normalBreathMask;
+        float activeExhale = (exhaleEnv * normalBreathMask) + (effAttack * 1.25f) + (painEnv * 1.10f) + (deathEnv * 1.35f);
+
         // 4. Zdrowie (HP) -> Nieregularna chrypa i dlawienie (Shimmer & Jitter wg Sekcji 2.2)
         shimmerPhase += (6.5f / currentSampleRate) * juce::MathConstants<float>::twoPi;
         if (shimmerPhase >= juce::MathConstants<float>::twoPi) shimmerPhase -= juce::MathConstants<float>::twoPi;
@@ -317,7 +470,7 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         if (jitterPhase >= juce::MathConstants<float>::twoPi) jitterPhase -= juce::MathConstants<float>::twoPi;
 
         float shimmerMod = 1.0f - (damageAmount * 0.50f * ((std::sin(shimmerPhase) + 1.0f) * 0.5f));
-        float pitchWeakness = 1.0f + (damageAmount * 0.12f * std::sin(jitterPhase)) - (damageAmount * 0.25f * exhaleProgress);
+        float pitchWeakness = 1.0f + (damageAmount * 0.12f * std::sin(jitterPhase)) - (damageAmount * 0.25f * exhaleProgress * normalBreathMask);
 
         // 3. Stan walki -> Biologiczna kaskada nieliniowosci krtani (Sekcja 2.2)
         mod1Phase += (fmFreq1 / currentSampleRate) * juce::MathConstants<float>::twoPi;
@@ -327,12 +480,21 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         if (mod2Phase >= juce::MathConstants<float>::twoPi) mod2Phase -= juce::MathConstants<float>::twoPi;
         if (mod3Phase >= juce::MathConstants<float>::twoPi) mod3Phase -= juce::MathConstants<float>::twoPi;
 
-        float chaosWave = std::cos(mod1Phase + 0.8f * std::cos(mod2Phase + 0.5f * std::cos(mod3Phase)));
-        float fmGrowlOffset = chaosWave * (basePitch * 0.22f * smoothedCombat);
+        float chaosDepth = (0.22f * smoothedCombat + 0.26f * effAttack + 0.34f * deathEnv) * (1.0f - 0.55f * painEnv);
+        float chaosBoost = (0.5f * effAttack) + (0.65f * deathEnv);
+        float chaosWave = std::cos(mod1Phase + (0.8f + chaosBoost) * std::cos(mod2Phase + (0.5f + 0.8f * chaosBoost) * std::cos(mod3Phase)));
+        float fmGrowlOffset = chaosWave * (basePitch * chaosDepth);
 
-        // Kontur tonu z lekkim opadaniem pod koniec wydechu
-        float pitchContour = 1.0f - (0.12f * exhaleProgress);
-        float instantFreq = juce::jmax(18.0f, (basePitch * pitchContour * pitchWeakness) + fmGrowlOffset);
+        // Kontur tonu:
+        // - Atak: opadajacy ryk (+18% -> -18%) z lekka losowoscia
+        // - Obrazenia: krotki wzdryg (+38% -> -15%) z lekka losowoscia
+        // - Smierc: poczatkowy krzyk (+30%) plynnie opadajacy w gleboki, agonalny bas (-48%)
+        float attackPitchMult = 1.0f + effAttack * ((0.18f - 0.36f * attackPhase) + (attackPitchVar - 1.0f));
+        float painPitchMult = 1.0f + painEnv * ((0.38f * std::exp(-4.5f * painPhase) - 0.15f * painPhase) + (painPitchVar - 1.0f));
+        float deathPitchMult = deathActive ? (0.52f + 0.78f * std::exp(-2.8f * deathPhase)) : 1.0f;
+
+        float pitchContour = (1.0f - (0.12f * exhaleProgress * normalBreathMask)) * attackPitchMult * painPitchMult * deathPitchMult;
+        float instantFreq = juce::jmax(16.0f, (basePitch * pitchContour * pitchWeakness) + fmGrowlOffset);
 
         // Impulsowy przeplyw krtaniowy g[n] + subharmoniczna (aktywna tylko dla wiekszych potworow)
         mainPhase += instantFreq / currentSampleRate;
@@ -345,24 +507,35 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         float glottalPulse = rawSin * std::exp(1.5f * (rawSin - 1.0f));
         float subPulse = std::sin(subPhase * juce::MathConstants<float>::twoPi);
 
-        float throatFlutter = 1.0f - (0.45f * smoothedCombat * ((chaosWave + 1.0f) * 0.5f));
-        float glottalWave = (glottalPulse + (subWeight * smoothedCombat * subPulse)) * throatFlutter;
+        float effectiveSub = (subWeight * smoothedCombat + (subWeight + 0.20f) * effAttack + (subWeight + 0.25f) * deathEnv) * (1.0f - 0.55f * painEnv);
+        float activeRoughness = juce::jlimit(0.0f, 1.0f, juce::jmax(smoothedCombat, juce::jmax(effAttack, deathEnv))) * (1.0f - 0.65f * painEnv);
+        float throatFlutter = 1.0f - (0.45f * activeRoughness * ((chaosWave + 1.0f) * 0.5f));
+        float glottalWave = (glottalPulse + (effectiveSub * subPulse)) * throatFlutter;
 
-        // Szum turbulencyjny wyzwalany otwarciem krtani (Sekcja 2.1)
+        // Szum turbulencyjny + ostatnie tchnienie powietrza przy smierci
         float whiteNoise = randomGenerator.nextFloat() * 2.0f - 1.0f;
+        float painAirBurst = painEnv * std::exp(-5.0f * painPhase) * 0.75f;
+        float deathAirOut = deathEnv * (0.20f + 0.70f * deathPhase);
         float pulsedTurbulence = whiteNoise * (0.45f + 0.55f * std::abs(glottalWave));
-        float breathNoise = (whiteNoise * inhaleEnv) + (pulsedTurbulence * exhaleEnv);
+        float breathNoise = (whiteNoise * (inhaleEnv + painAirBurst + deathAirOut)) + (pulsedTurbulence * activeExhale);
 
-        // Miks zrodla: poza walka czysty oddech, w walce gardlowy warkot zintegrowany z szumem
-        float voiceLevel = exhaleEnv * (0.04f + 0.44f * smoothedCombat) * shimmerMod;
-        float noiseLevel = 0.85f - (0.15f * smoothedCombat);
+        // Miks zrodla
+        float baseVoice = 0.04f + 0.44f * smoothedCombat;
+        float eventVoice = (0.42f * effAttack) + (0.28f * painEnv) + (0.50f * deathEnv * (1.0f - 0.45f * deathPhase));
+        float voiceLevel = activeExhale * juce::jmin(0.95f, baseVoice + eventVoice) * shimmerMod;
+        float noiseLevel = (0.85f - 0.15f * smoothedCombat) + (0.20f * effAttack) + (0.25f * painEnv) + (0.30f * deathEnv);
         float excitation = (glottalWave * voiceLevel) + (breathNoise * noiseLevel);
 
-        // Model traktu glosowego (Sekcja 1.1: F1 zmiennosc 23%, F2 zmiennosc 61%)
-        float jawOpen = exhaleEnv * (0.35f + 0.55f * smoothedCombat) + (inhaleEnv * 0.3f);
-        float f1Hz = juce::jlimit(60.0f, 3600.0f, 200.0f * (1.0f + 0.23f * jawOpen) * formantScale);
-        float f2Hz = juce::jlimit(180.0f, 5500.0f, 520.0f * (1.0f + 0.61f * jawOpen) * formantScale);
-        float f3Hz = juce::jlimit(400.0f, 7500.0f, 1250.0f * (1.0f + 0.30f * jawOpen) * formantScale);
+        // Model traktu glosowego (F1, F2, F3)
+        float attackFormantSweep = effAttack * (1.0f - 0.65f * attackPhase);
+        float deathFormantSweep = deathEnv * (1.0f - 0.80f * deathPhase);
+        float jawOpen = activeExhale * (0.35f + 0.55f * smoothedCombat) + (inhaleEnv * 0.3f) + (1.35f * attackFormantSweep) + (1.50f * deathFormantSweep);
+        float painF1Shift = 1.0f + (0.25f * painEnv);
+        float painF2Shift = 1.0f + (0.35f * painEnv);
+
+        float f1Hz = juce::jlimit(60.0f, 3600.0f, 200.0f * (1.0f + 0.23f * jawOpen) * formantScale * painF1Shift);
+        float f2Hz = juce::jlimit(180.0f, 5500.0f, 520.0f * (1.0f + 0.61f * jawOpen) * formantScale * painF2Shift);
+        float f3Hz = juce::jlimit(400.0f, 7500.0f, 1250.0f * (1.0f + 0.30f * jawOpen) * formantScale * (1.0f + 0.25f * juce::jmax(effAttack, deathEnv)));
 
         float f1 = 2.0f * std::sin(juce::MathConstants<float>::pi * f1Hz / currentSampleRate);
         float f2 = 2.0f * std::sin(juce::MathConstants<float>::pi * f2Hz / currentSampleRate);
@@ -382,23 +555,32 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         wheezeLow = juce::jlimit(-4.0f, 4.0f, wheezeLow + fWheeze * wheezeBand);
         wheezeBand = juce::jlimit(-4.0f, 4.0f, wheezeBand + fWheeze * (whiteNoise * inhaleEnv - wheezeLow - 0.16f * wheezeBand));
 
-        float tractOut = (bp1Band * 1.0f) + (bp2Band * 1.1f) + (bp3Band * 0.65f) + (wheezeBand * damageAmount * 0.9f);
+        float tractOut = (bp1Band * (1.0f + 0.20f * effAttack + 0.30f * deathEnv))
+            + (bp2Band * (1.1f + 0.45f * effAttack + 0.25f * painEnv + 0.40f * deathEnv))
+            + (bp3Band * (0.65f + 0.55f * effAttack + 0.20f * painEnv + 0.35f * deathEnv))
+            + (wheezeBand * damageAmount * 0.9f);
 
         // Filtr odbicia wargowego (Lip Reflection HPF) - wycina niski bas u malych potworow
         float lipCutoff = juce::jlimit(0.01f, 0.12f, 0.025f / safeScale);
         lipReflectState += lipCutoff * (tractOut - lipReflectState);
         float lipOutput = tractOut - (0.70f * lipReflectState);
 
-        // Glowny filtr LPF i saturacja WaveShaper sterowane przez HP
-        lastFilterOut += filterAlpha * (lipOutput - lastFilterOut);
-        float drive = 1.0f + (damageAmount * 3.0f);
+        // Glowny filtr LPF (przy smierci otwiera sie na poczatku krzyku i zamyka przy upadku)
+        float deathFilterOpen = 0.42f * deathEnv * (1.0f - 0.75f * deathPhase);
+        float effectiveAlpha = juce::jlimit(0.0f, 1.0f, filterAlpha + (0.28f * effAttack) + (0.32f * painEnv) + deathFilterOpen);
+        lastFilterOut += effectiveAlpha * (lipOutput - lastFilterOut);
+
+        float drive = 1.0f + (damageAmount * 3.0f) + (0.55f * effAttack) + (0.75f * deathEnv);
         float finalSignal = std::tanh(lastFilterOut * drive) * shimmerMod;
 
-        float outputSample = finalSignal * currentVolume;
+        float eventGain = 1.0f + (0.35f * effAttack) + (0.15f * painEnv) + (0.40f * deathEnv);
+        float outputSample = finalSignal * currentVolume * eventGain;
 
         leftBuffer[sample] = outputSample;
         rightBuffer[sample] = outputSample;
     }
+
+    g_damageVisualEnv = lastPainEnv;
 }
 
 //==============================================================================
