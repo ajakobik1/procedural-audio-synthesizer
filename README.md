@@ -58,19 +58,23 @@ A real-time procedural audio synthesis system written in **C++**, designed to dy
 
 ### Prerequisites
 
-- C++ compiler with MSVC / Visual Studio 2022 (Windows)
-- CMake (with preset support) & `vcpkg`
+- Visual Studio 2022 (MSVC x64, Windows)
+- CMake 3.30+ & `vcpkg` (with the `VCPKG_ROOT` environment variable set)
 - JUCE & Projucer
 
 ### 1. Native Telemetry Plugin (`F4SE_plugin`)
 
-Configure and build using the presets defined in `CMakePresets.json` (with `vcpkg` toolchain configured):
+Configure and build the Release (or Debug) preset defined in `CMakePresets.json`:
 
 ```bash
 cd F4SE_plugin
-cmake --list-presets
-cmake --preset <preset-name>
-cmake --build --preset <preset-name>
+# Release build
+cmake --preset build-release-msvc
+cmake --build --preset release-msvc
+
+# Or Debug build
+cmake --preset build-debug-msvc
+cmake --build --preset debug-msvc
 ```
 
 ### 2. Procedural Audio Synthesizer (`JUCE_plugin`)
